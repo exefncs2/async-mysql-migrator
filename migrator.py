@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import aiomysql
 
@@ -17,6 +17,17 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 舊版 MySQL 常見無效零日期字串，於嚴格模式寫入目標庫前須轉為 NULL
+INVALID_ZERO_DATES = frozenset({"0000-00-00", "0000-00-00 00:00:00"})
+
+
+def sanitize_row_values(row: Mapping[str, Any], columns: Sequence[str]) -> tuple[Any, ...]:
+    """清洗單筆資料列，將舊 MySQL 零日期字串轉為 None 避免目標庫嚴格模式報錯。"""
+    return tuple(
+        None if isinstance(row[col], str) and row[col] in INVALID_ZERO_DATES else row[col]
+        for col in columns
+    )
 
 
 def rewrite_create_table_sql(
@@ -109,10 +120,11 @@ async def replicate_table_schema(
 async def stream_table_data(
     source_pool: aiomysql.Pool,
     target_pool: aiomysql.Pool,
+    target_db: str,
     table_name: str,
     batch_size: int,
 ) -> int:
-    """以串流方式逐批讀寫資料表，避免大表一次載入造成記憶體溢位。"""
+    """以串流方式逐批讀寫資料表，自動清洗零日期並避免大表一次載入造成記憶體溢位。"""
     async with source_pool.acquire() as count_conn:
         async with count_conn.cursor() as count_cursor:
             await count_cursor.execute(f"SELECT COUNT(1) FROM `{table_name}`;")
@@ -139,8 +151,8 @@ async def stream_table_data(
                 columns = list(batch[0].keys())
                 col_sql = ", ".join(f"`{col}`" for col in columns)
                 placeholders = ", ".join(["%s"] * len(columns))
-                insert_sql = f"INSERT INTO `{table_name}` ({col_sql}) VALUES ({placeholders});"
-                values = [tuple(row[col] for col in columns) for row in batch]
+                insert_sql = f"INSERT INTO `{target_db}`.`{table_name}` ({col_sql}) VALUES ({placeholders});"
+                values = [sanitize_row_values(row, columns) for row in batch]
 
                 await dst_cur.executemany(insert_sql, values)
                 await dst_conn.commit()
@@ -183,6 +195,7 @@ async def migrate_database(
             await stream_table_data(
                 source_pool=source_pool,
                 target_pool=target_pool,
+                target_db=target_config.database,
                 table_name=table_name,
                 batch_size=options.batch_size,
             )

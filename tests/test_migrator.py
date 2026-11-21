@@ -1,4 +1,4 @@
-"""設定載入與建表 SQL 正規化單元測試。"""
+"""設定載入、建表 SQL 正規化與零日期清洗單元測試。"""
 
 import os
 import sys
@@ -7,15 +7,14 @@ from unittest.mock import MagicMock, patch
 
 from config import DatabaseConfig
 
-# 於未安裝 aiomysql 的輕量測試環境中以替身模組載入純函式，直接驗證正式程式碼
 if "aiomysql" not in sys.modules:
     sys.modules["aiomysql"] = MagicMock()
 
-from migrator import rewrite_create_table_sql  # noqa: E402
+from migrator import rewrite_create_table_sql, sanitize_row_values  # noqa: E402
 
 
 class TestMigratorConfigAndSql(unittest.TestCase):
-    """驗證 Fail Fast 設定載入與字元集轉換規則。"""
+    """驗證 Fail Fast 設定載入、字元集轉換與零日期清洗規則。"""
 
     def test_missing_env_raises_value_error(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -46,6 +45,11 @@ class TestMigratorConfigAndSql(unittest.TestCase):
         raw = "CREATE TABLE `logs` (`id` INT);"
         out = rewrite_create_table_sql(raw, source_db="src_db")
         self.assertTrue(out.endswith("DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;"))
+
+    def test_sanitize_row_converts_zero_dates_to_none(self) -> None:
+        row = {"id": 1, "birth": "0000-00-00", "updated_at": "0000-00-00 00:00:00", "name": "Felix"}
+        cleaned = sanitize_row_values(row, ["id", "birth", "updated_at", "name"])
+        self.assertEqual(cleaned, (1, None, None, "Felix"))
 
 
 if __name__ == "__main__":
