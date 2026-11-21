@@ -1,70 +1,78 @@
-# Async MySQL Migrator
+# Async MySQL Migrator（MySQL 非同步跨庫遷移實作筆記）
 
-使用 Python `asyncio` + `aiomysql` 撰寫的 MySQL 跨庫資料表結構與資料搬移工具。
+> 一個以 Python `asyncio` + `aiomysql` 實作的 MySQL 跨庫搬移工具紀錄，重點整理實務遷移時常碰到的編碼亂碼、無效零日期與大表記憶體問題。
 
-## 1. 緣起與解決的問題
+## 1. 學習背景與實務痛點
 
-實務上把舊環境的 MySQL 資料庫搬到新環境時，常遇到三個麻煩：
-1. **編碼混雜導致亂碼**：舊表常殘留 `latin1` 或不一致的排序規則，搬過去中文就出問題。
-2. **舊資料含無效零日期**：舊版 MySQL 允許存 `0000-00-00`，但在新版嚴格模式下寫入會直接中斷報錯。
-3. **大表一次讀爆記憶體**：如果先 `fetchall()` 把整張表載進記憶體再逐筆寫入，遇到幾十萬筆以上的表很容易 OOM 且耗時很久。
-
-這支工具就是針對這幾個實務痛點整理出來的搬移腳本。
+在把舊系統 MySQL 資料表搬移到新環境時，實作過程中陸續碰到三個坑：
+1. **文字欄位編碼殘留**：從來源庫拉出來的 `SHOW CREATE TABLE` 語法常帶著來源庫前綴（`` `source_db`. ``）與舊編碼（如 `latin1`）；就算只改了建表語法結尾的 `DEFAULT CHARSET=utf8mb4`，原本個別欄位上的字元集設定仍可能沒跟著轉，搬完還是亂碼。
+2. **舊資料含有 `"0000-00-00"` 零日期**：舊版 MySQL 允許寫入零日期字串，但新版資料庫預設開啟嚴格模式，直接寫入會中斷失敗。
+3. **一次載入整張表容易爆記憶體**：初版先將整張表分批讀完收集成一整包 list 後再逐筆 `INSERT`，表一大起來既吃記憶體又慢。
 
 ---
 
-## 2. 設計思路與關鍵取捨
+## 2. 設計思路與重構演進
 
-### (1) 為什麼先重寫建表 SQL，還要再補一次 `ALTER TABLE ... CONVERT TO`？
-- 從來源庫拿到的 `SHOW CREATE TABLE` 語法，除了可能夾帶來源庫前綴（`` `source_db`. ``）外，就算改了表尾的 `DEFAULT CHARSET=utf8mb4`，原本單獨標記在個別欄位上的 `CHARACTER SET latin1` 還是不會跟著改。
-- 因此流程採兩階段：先清掉來源庫前綴並統一表層級編碼，建表後再對目標表執行 `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4`，確保所有文字欄位都徹底轉碼。
-- 另外在 `DROP TABLE` 前會明確加上目標庫名稱（`` `target_db`.`table_name` ``），避免連線誤切時砍錯來源庫。
+### (1) 表結構重建與強制轉碼兩段式處理
+- 先用 `SHOW CREATE TABLE` 取得原表結構，透過正規表達式移除來源庫名稱並統一字元集為 `utf8mb4`／`utf8mb4_general_ci`。
+- 在目標庫明確指定資料庫名稱（`` `target_db`.`table_name` ``）執行 `DROP TABLE IF EXISTS` → `CREATE TABLE`，避免任何誤砍來源庫的風險。
+- 建表後再補執行 `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4`，確保表內所有文字欄位都徹底轉碼。
 
-### (2) 為什麼改為「串流分批讀寫」與 `executemany`？
-- 初版原本是先把整張表讀完存成 list 再逐筆 `execute`，後來重構成在同一個迴圈裡逐批 `LIMIT / OFFSET` 讀取、立刻清洗零日期、立刻用 `executemany` 整批寫入並 `commit`。
-- **好處**：記憶體占用固定在單批（預設 10,000 筆）以內，寫入速度也比逐筆送 SQL 快很多。
+### (2) 從「整表暫存」改為「定額記憶體串流分批」
+- 後來重構成在單一分批迴圈內「讀一批（`LIMIT / OFFSET`）→ 清洗零日期（`"0000-00-00"` 轉 `None`）→ `executemany` 整批寫入並 `commit`」，記憶體用量固定控制在單批大小內（預設 10,000 筆），同時即時輸出進度百分比。
 
-### (3) 為什麼保留零日期清洗（`sanitize_row_values`）？
-- 寫入前會檢查每個欄位，把 `"0000-00-00"` 與 `"0000-00-00 00:00:00"` 轉成 `None`（對應 SQL `NULL`），避免新資料庫開啟 `NO_ZERO_DATE` 嚴格模式時整批失敗。
+### (3) 從「手動改程式碼」改為「三檔分離＋CLI 參數」
+- 初版若要切換 `.env` 檔、指定單一資料表或只複製結構，都必須直接改 `main.py` 原始碼。
+- 重構後拆成三個檔案，並把原本常修改的四個項目全部改成命令列參數，也順便補上不需連真實 MySQL 就能驗證邏輯的單元測試：
+  - `config.py`：常數、不可變 `DatabaseConfig` / `MigrationOptions` 與環境變數 Fail Fast 檢查。
+  - `migrator.py`：SQL 改寫、零日期清洗、表結構重建與串流分批核心邏輯。
+  - `main.py`：CLI 參數解析與啟動進入點。
 
-### (4) 為什麼拆成三檔（`config.py` / `migrator.py` / `main.py`）？
-- 把環境變數檢查（`DatabaseConfig.from_env`）、純邏輯（SQL 字元集改寫、零日期清洗、串流搬移）與 CLI 參數解析分開，這樣不用真的架兩台 MySQL，也能先透過 `unittest` 驗證設定驗證與資料轉換邏輯沒寫壞。
-
----
-
-## 3. 目前已知限制
-
-- **超大表分頁效能**：目前採 `LIMIT / OFFSET` 分批，幾十萬筆以內很順，但若是千萬筆以上超大表，後段 `OFFSET` 掃描成本會拉高；這類情境建議改用主鍵游標分頁（Keyset Pagination）。
-- **全量覆蓋模式**：目標表會先 `DROP TABLE IF EXISTS` 再重建，適合初始化或離線整庫搬遷，不適合線上雙寫增量同步。
+### (4) 目前已知限制
+- 分批讀取使用 `LIMIT / OFFSET`，在幾十萬筆以內表現穩定；若面對千萬筆以上超大表，後段頁次會變慢，較適合改用主鍵游標分頁。
+- 目標表採 `DROP + CREATE` 全量重建，僅適用於初始化或離線全量遷移，不適用於線上即時增量同步。
 
 ---
 
-## 4. 專案結構
+## 3. 正式使用方式
 
-```text
-async-mysql-migrator/
-├── config.py        # 常數、不可變連線設定與 Fail Fast 環境變數檢查
-├── migrator.py      # 建表 SQL 改寫、零日期清洗與分批串流讀寫邏輯
-├── main.py          # CLI 參數解析與執行進入點
-├── tests/           # 單元測試（設定檢查、SQL 轉換、零日期清洗）
-└── .env.example     # 來源與目標資料庫連線範本
-```
-
-## 5. 執行方式
-
+### 步驟 1：安裝依賴與建立環境設定檔
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
+```
 
-# 搬移全部資料表
+編輯 `.env` 填入來源與目標資料庫連線資訊：
+```ini
+SOURCE_DB_HOST=your_source_host
+SOURCE_DB_PORT=3306
+SOURCE_DB_USER=your_source_user
+SOURCE_DB_PASSWORD=your_source_password
+SOURCE_DB_NAME=your_source_db
+
+TARGET_DB_HOST=your_target_host
+TARGET_DB_PORT=3306
+TARGET_DB_USER=your_target_user
+TARGET_DB_PASSWORD=your_target_password
+TARGET_DB_NAME=your_target_db
+```
+
+### 步驟 2：執行遷移指令
+```bash
+# 搬移全部資料表（預設讀取 .env、每批 10,000 筆）
 python main.py
 
-# 只搬指定資料表並自訂批次大小
-python main.py --env .env.prod --tables users orders --batch-size 5000
+# 對應舊版「指定 env 檔」與「指定資料表」
+python main.py --env .env_A --tables users orders --batch-size 5000
 
-# 只重建目標庫表結構，不搬資料
+# 對應舊版「只拉表結構不拉資料」
 python main.py --schema-only
 
-# 執行單元測試
+# 對應舊版「自訂字元集與排序規則」
+python main.py --charset utf8mb4 --collation utf8mb4_unicode_ci
+```
+
+### 步驟 3：執行單元測試
+```bash
 python -m unittest discover -s tests -v
 ```
