@@ -1,2 +1,2 @@
-aiomysql
-python-dotenv
+aiomysql>=0.2.0
+python-dotenv>=1.2.2
